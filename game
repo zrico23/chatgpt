@@ -1,0 +1,709 @@
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <time.h>
+#include <sys/ioctl.h> // per get_terminal_size
+
+#define NUM_STANZE 5 // Numero di stanze tra le locazioni (messe per prime nell' ENUM)
+#define NUM_LOCAZIONI 10 // Numero totale di locazioni (stanze + normali)
+#define NUM_OGGETTI 12 // Numero totale di oggetti
+#define MAX_COMMANDS 4 // Numero massimo di comandi
+#define TOT_TOKEN 6 // Numero di token da raccogliere (distruggendo gli horcrux)
+#define GAME_DURATION 900 // Durata della partita in secondi
+#define MAX_OGGETTI_RACCOLTI 2 // Numero massimo di oggetti che puoi tenere
+
+#define TIME_FOR_QUESTION 30 // tempo per ogni domanda posta alla fenice
+
+// Ad ogni iterazione per ora scelgo di imporre questa dimensione del terminale, poi se vuoi rendilo libero e ad ogni iterazione ti ricavi le dimensioni attuali.
+#define ROWS_TERMINAL 30
+#define COLS_TERMINAL 102
+
+/**  --------------------------------PER ORA INUTILE--------------------------------
+ * Ottiene le dimensioni del terminale.
+ * @param rows Puntatore all'intero in cui memorizzare il numero di righe del terminale.
+ * @param cols Puntatore all'intero in cui memorizzare il numero di colonne del terminale.
+ */
+void get_terminal_size(int *rows, int *cols) {
+    struct winsize ws;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+}
+
+// Elenco delle locazioni ()
+enum Locazioni_enum{
+    // stanze:
+    INGRESSO,
+    SILENTE,
+    SEGRETI,
+    NECESSITA,
+    ARTI_OSCURE,
+    // location:
+    BACHECA,
+    CAPPELLO, 
+    BASILISCO, 
+    ARMADIO,
+    FENICE
+};
+enum Tipo_location{
+    STANZA,
+    OGGETTO_LOC
+};
+// Elenco degli oggetti
+enum Oggetti_enum{
+    SPADA,
+    BACCHETTA,
+    DENTE,
+    MOLLICCIO,
+    FOLLETTO,
+    SERPENTE,
+    ANELLO,
+    DIARIO,
+    DIADEMA,
+    COPPA,
+    MEDAGLIONE,
+    LUCCHETTO
+};
+enum Tipo_object{
+    NORMAL_OBJ,
+    HORCRUX
+};
+// Comandi opzionali per gli oggetti (non metto LOOK che tanto possiamo farlo su qualsiasi location/oggetto)
+enum Comandi_enum{
+    NESSUN,
+    TAKE,
+    USE1,
+    USE2
+};
+
+/**
+    Struttura che definisce una "location". 
+    Tipi di location: tipo stanza (posto segnato sulla mappa in cui puoi andare) e tipo oggetto (un oggetto che però puoi soltanto guardare e che può contenere altri oggetti)
+*/
+struct Location {
+    char name[50]; // Nome della location
+    char look_text[1024]; // contiene la descrizione del comando look
+    struct Location *from_location; // indica da dove puoi accedere a questa location (null -> ovunque)
+    enum Tipo_location tipo; // indica il tipo della location (stanza / oggetto)
+};
+
+// Struttura per rappresentare un enigma (che sia a risposta multipla o a risposta secca, domanda conterrà il testo con le opzioni se previste)
+struct Enigma {
+    char domanda[512];
+    char risposta_corretta[32];
+};
+/**
+    Struttura che definisce un oggetto
+*/
+struct Object{
+    char name[50]; // Nome dell'Object
+    enum Tipo_object tipo; // tipo Normale o Horcrux
+    struct Location *luogo; // indica la location in cui si trova l'oggetto
+    char look_text[1024]; // contiene la descrizione del comando look
+    bool raccolto;
+    bool is_in_game; // indica se l'oggetto è ancora presente sulla mappa oppure è stato distrutto (caso horcrux) o 
+    // per gli oggetti non horcrux:
+    struct Enigma *enigma; // indica l'enigma associato se presente, null se l'oggetto non è bloccato
+    enum Comandi_enum comando_per_enigma; // Indica quale comando deve essere utilizzato per risolvere l'enigma
+    bool allowed_comandi[MAX_COMMANDS]; // indica quali comandi possono essere usati sull'oggetto (allowed_comandi[TAKE] true/false?)
+    struct Object *object_unlocked; // indica quale oggetto sblocchi (se presente)
+    // per gli horcrux :
+    struct Object *can_be_destroyed_by; // indica se e l'oggetto con cui può essere distrutto (spada o dente)
+    struct Object *locked_by; // indica se e l'oggetto che blocca questo horcrux (es folletto o molliccio)
+};
+
+struct Location init_Location(char *name, char *look_text, struct Location *from_location, enum Tipo_location tipo) {
+    struct Location loc;
+    strcpy(loc.name, name);
+    strcpy(loc.look_text, look_text);
+    loc.from_location = from_location;
+    loc.tipo = tipo;
+    return loc;
+}
+
+struct Enigma init_Enigma(char *domanda, char *risposta_corretta) {
+    struct Enigma enigma;
+    strcpy(enigma.domanda, domanda);
+    strcpy(enigma.risposta_corretta, risposta_corretta);
+    return enigma;
+}
+
+struct Object init_Object(char *name, enum Tipo_object tipo, struct Location *luogo, char *look_text, bool raccolto, bool is_in_game, struct Enigma *enigma, enum Comandi_enum comando_per_enigma, bool allowed_comandi[], struct Object *object_unlocked, struct Object *can_be_destroyed_by, struct Object *locked_by) {
+    struct Object obj;
+    int i;
+    // Inizializzazione dei campi comuni
+    strcpy(obj.name, name);
+    obj.tipo = tipo;
+    obj.luogo = luogo;
+    strcpy(obj.look_text, look_text);
+    obj.raccolto = raccolto;
+    obj.is_in_game = is_in_game;
+    // Inizializzazione campi oggetto normale
+    obj.enigma = enigma;
+    obj.comando_per_enigma = comando_per_enigma;
+    // Copia i comandi consentiti
+    for (i = 0; i < MAX_COMMANDS; i++) {
+        obj.allowed_comandi[i] = allowed_comandi[i];
+    }
+    obj.object_unlocked = object_unlocked;
+    // Inizializzazione dei campi specifici agli Horcrux
+    obj.can_be_destroyed_by = can_be_destroyed_by;
+    obj.locked_by = locked_by;
+
+    return obj;
+}
+
+struct Comandi{
+    char nome[15];
+    char descrizione[100];
+};
+
+/**
+ * Sposta il cursore del terminale alla riga e colonna specificate.
+ * @param row La riga a cui spostare il cursore.
+ * @param col La colonna a cui spostare il cursore.
+ */
+void move_cursor(int row, int col) {
+    printf("\033[%d;%dH", row, col);
+}
+
+/**
+
+ */
+void stampa_map(char *map[], int rows){
+    int i;
+    for (i = 0; i < rows; i++) {
+        move_cursor(ROWS_TERMINAL-7+i, COLS_TERMINAL-29);
+        printf("%s\n", map[i]);
+    }
+}
+
+/**
+
+ */
+void stampa_nome_game(char *game[], int rows){
+    int i;
+    for (i = 0; i < rows; i++) {
+        move_cursor(i+1, (COLS_TERMINAL/2)-23);
+        printf("%s\n", game[i]);
+    }
+}
+
+void stampa_raggiungibili(struct Location *locazioni,  struct Object *oggetti, struct Location *stanza_attuale){
+    int i;
+    move_cursor(ROWS_TERMINAL-3,1);
+
+    printf("Oggetti e location stanza:\n");
+    move_cursor(ROWS_TERMINAL-2,1);
+    for(i=0;i<NUM_LOCAZIONI;i++){
+        if(locazioni[i].from_location == NULL || locazioni[i].from_location == stanza_attuale){
+            printf("-%s ",locazioni[i].name);
+        }
+    }
+    move_cursor(ROWS_TERMINAL-1,1);
+    for(i=0;i<NUM_OGGETTI;i++){
+        if(oggetti[i].luogo == stanza_attuale && oggetti[i].is_in_game && !oggetti[i].raccolto){ //stampo gli oggetti che sono presenti nella stanza (per quelli raccolti c'è il comando)
+            printf("-%s ",oggetti[i].name);
+        }
+    }
+}
+
+void stampa(char *map[], char *tok, char *time, int rows_map, struct Location *locazioni,  struct Object *oggetti, struct Location *stanza_attuale){
+    system("clear");
+    stampa_map(map,rows_map);
+    stampa_raggiungibili(locazioni, oggetti, stanza_attuale);
+    move_cursor(1,1);
+    printf("%s", tok); // Stampa i tokens in alto a sinistra
+    move_cursor(1, COLS_TERMINAL - strlen(time) + 1); // Stampa il tempo rimanente in alto a destra
+    printf("%s", time);
+    printf("\n");  // Vai a una nuova riga
+}
+
+/**
+ * Funzione per pulire il buffer di input dopo i clear (e poter usare getchar())
+*/
+void clear_stdin() {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { }
+}
+
+void fine_gioco(bool vittoria){
+    if(vittoria){
+        clear_stdin();
+        system("clear");
+        printf("Complimenti, hai distrutto l'ultimo horcrux e liberato Hogwarts in tempo!\n");
+        printf("Il gioco è finito\n");
+        exit(1);
+    }else{
+        clear_stdin();
+        system("clear");
+        printf("Il tempo è scaduto e non sei riuscito a distruggere tutti gli horcrux, Voldemort ha ora il controllo del castello\n");
+        exit(1);
+    }
+}
+
+// Funzione per ottenere il tempo corrente in secondi
+int get_current_time_seconds() {
+    time_t rawtime;
+    struct tm *timeinfo;
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    int current_total_sec = timeinfo->tm_hour * 3600 + timeinfo->tm_min * 60 + timeinfo->tm_sec;
+
+    return current_total_sec;
+}
+
+struct Comandi init_comando(char *nome, char *desc){
+    struct Comandi cmd;
+    strcpy(cmd.nome,nome);
+    strcpy(cmd.descrizione,desc);
+    return cmd;
+}
+
+void stampa_comandi(struct Comandi *comandi){
+    int i;
+
+    printf("Comandi di gioco:\n");
+    for(i = 0; i < 5; i++){
+        printf("%s: %s\n",comandi[i].nome,comandi[i].descrizione);
+    }
+}
+
+int main() {
+    struct Location locazioni[NUM_LOCAZIONI]; // Elenco di location
+    struct Object oggetti[NUM_OGGETTI]; // Elenco di oggetti
+    struct Enigma enigma_spada, enigma_folletto, enigma_molliccio, enigma_lucchetto;
+    char text[1024];
+
+    bool allowed_comandi1[MAX_COMMANDS] = {false, true, true, false}; // TAKE, USE1
+    bool allowed_comandi2[MAX_COMMANDS] = {false, false, false, true}; // USE2
+    struct Location *stanza_attuale = &locazioni[INGRESSO];
+    char text_attuale[1024];
+    char mossa[128];
+    char *comando, *param1_str, *param2_str; // stringhe relative al comando, al parametro 1 e al parametro 2
+    int i;
+    bool enigma = false;
+    char risposta[32];
+    struct Object *param1_obj = NULL, *param2_obj = NULL;
+    struct Location *param1_loc = NULL;
+    int token_raccolti = 0;
+    int minuti, secondi;
+    struct Comandi comandi[6];
+    int oggetti_raccolti = 0;
+
+    /* timer */
+    int tempo_iniziale = 0;
+
+    
+    char *map0[] = {
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░",
+        "░necessita /   /     segreti░",
+        "░──────────┼   ┼────────────░",
+        "░silente   /   / arti_oscure░",
+        "░──────────┼   ┼────────────░",
+        "░  ingresso  █              ░",
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"
+    };
+    char *map1[] = {
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░",
+        "░necessita /   /     segreti░",
+        "░──────────┼   ┼────────────░",
+        "░silente  █/   / arti_oscure░",
+        "░──────────┼   ┼────────────░",
+        "░  ingresso                 ░",
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"
+    };
+    char *map2[] = {
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░",
+        "░necessita /   /█    segreti░",
+        "░──────────┼   ┼────────────░",
+        "░silente   /   / arti_oscure░",
+        "░──────────┼   ┼────────────░",
+        "░  ingresso                 ░",
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"
+    };
+    char *map3[] = {
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░",
+        "░necessita█/   /     segreti░",
+        "░──────────┼   ┼────────────░",
+        "░silente   /   / arti_oscure░",
+        "░──────────┼   ┼────────────░",
+        "░  ingresso                 ░",
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"
+    };
+    char *map4[] = {
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░",
+        "░necessita /   /     segreti░",
+        "░──────────┼   ┼────────────░",
+        "░silente   /   /█arti_oscure░",
+        "░──────────┼   ┼────────────░",
+        "░  ingresso                 ░",
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"
+    };
+    int rows_map = sizeof(map0) / sizeof(map0[0]); // Numero di righe = righe*colonne/colonne, infatti sizeof(map)=righe*colonne e sizeof(map[0])=colonne della prima riga
+    
+    char *game_name[] = {
+        "█   █ █████  ████ █   █  ███   ███  █████ ████\n",
+        "█   █ █   █ █     █   █ █   █ █   █   █   █   \n",
+        "█████ █   █ █     █ █ █ █████ ████    █   ████\n",
+        "█   █ █   █ █   █ █ █ █ █   █ █  █    █      █\n",
+        "█   █ █████  ████  █ █  █   █ █   █   █   ████\n",
+        "______________________________________________\n"
+    };
+    int rows_game_name = sizeof(game_name) / sizeof(game_name[0]); 
+
+
+    printf("\033[8;%d;%dt",ROWS_TERMINAL,COLS_TERMINAL); // setup dimensione del terminale
+
+    // servirebbe l'enum lista_comandi, ma poi TAKE sarebbe duplicato, come risolvo?
+    comandi[0] = init_comando("look", "guarda una location o un object >look loc/obj");
+    comandi[1] = init_comando("take", "prova a prendere un object >take obj");
+    comandi[2] = init_comando("use", "prova ad usare un oggetto da solo o con un altro oggetto se specificato >use obj1 [obj2]");
+    comandi[3] = init_comando("objs", "ottieni la lista degli oggetti raccolti >objs");
+    comandi[4] = init_comando("fanny", "richiama la fenice per aiutarti ad andare avanti >fanny");
+    comandi[5] = init_comando("drop", "deposita un oggetto che ritorna nel suo punto originale >drop obj");
+
+// inizializzazione Locations di tipo stanza
+    strcpy(text,"Ti trovi nell'ingresso del castello della scuola di magie e stregonerie di Hogwarts. Davanti a te un vasto corridoio con delle scale su cui è presente un **serpente** molto lungo, sulla destra troviamo dei muri con esposta una ++bacheca++, sembra ci siano scritti degli incantesimi... Le scale portano ad altre stanze, sulla sinistra troviamo l'ufficio di ++silente++ e poco più in alto la stanza delle ++necessita++, sulla destra troviamo invece la camera dei ++segreti++ e l'aula di difesa contro le ++arti_oscure++");
+    locazioni[INGRESSO] = init_Location("ingresso", text, NULL, STANZA);
+    strcpy(text,"Entri nell'ufficio di Albus Silente, uno degli ultimi presidi della scuola. La stanza è di forma circolare molto ampia e accogliente, sulla sinistra c'è uno scaffale con un ++cappello++, sembra avere una bocca... Davanti a te c'è una scrivania con sopra un **anello** ed una **bacchetta**, sulla destra è presente invece una ++fenice++ posata su un trespolo");
+    locazioni[SILENTE] = init_Location("silente", text, &locazioni[INGRESSO], STANZA);
+    strcpy(text,"Dopo un lungo cammino raggiungi i sotterranei dove si trova la camera dei segreti. Ti trovi in una sala molto lunga, debolmente illuminata. Pilastri di pietra torreggianti, formati da vari serpenti avvinghiati, si levano fino al soffitto, perdendosi nel buio e gettando lunghe ombre nere nella strana oscurità verdastra che avvolge il luogo. Al centro un gigantesco ++basilisco++ steso a bocca aperta, sulla destra al suo fianco è presente un **diario** tutto nero e malandato");
+    locazioni[SEGRETI] = init_Location("segreti", text, &locazioni[INGRESSO], STANZA);
+    strcpy(text,"Entri nella stanza delle necessità, nota anche come Stanza Va-e-Vieni, è una stanza magica nel Castello di Hogwarts che appare solo quando c'è chi ne ha veramente bisogno, e ha sempre tutto quello che serve a chi la cerca. Questa volta appare come un enorme stanza vuota che sembra non avere fine. Davanti all'ingresso c'è una bacheca di vetro piena di oggetti preziosi tra cui un **diadema**. E' però bloccata da un **lucchetto**");
+    locazioni[NECESSITA] = init_Location("necessita", text, &locazioni[INGRESSO], STANZA);
+    strcpy(text,"Entri nell'aula di difesa contro le artui oscure. Un'aula di studio molto illuminata, i banchi sono spostati ai lati insieme alle sedie. Al centro è posto un ++armadio++ misterioso, mentre in volo c'è un **folletto** della Cornovaglia, sembra avere qualcosa che luccica attorno al collo");
+    locazioni[ARTI_OSCURE] = init_Location("arti_oscure", text, &locazioni[INGRESSO], STANZA);
+// inizializzazione Locations di tipo oggetto
+    strcpy(text,"Alcuni degli incantesimi di base utili in varie occasioni:\nlumus, immobilus, wingardium leviosa, riddikulus, alohomora, accio ...");
+    locazioni[BACHECA] = init_Location("bacheca", text, &locazioni[INGRESSO], OGGETTO_LOC);
+    strcpy(text,"Hai davanti il famoso cappello parlante di Hogwarts, un cappello senziente creato dai 4 maghi fondatori, si occupa ogni anno di smistare i nuovi apprendisti nelle varie casate di Hogwarts! Contiene al suo interno qualcosa che luccica, sembrerebbe una **spada**");
+    locazioni[CAPPELLO] = init_Location("cappello", text, &locazioni[SILENTE], OGGETTO_LOC);
+    strcpy(text,"Il basilisco è un serpente gigante, noto anche come il Re dei Serpenti. Presenta un colore verde brillante con gli occhi gialli. Può raggiungere 150 metri di lunghezza ed è molto velenoso. Giace steso a terra con una ferita profonda nel palato. Ha un **dente** che sembra potersi staccare facilmente");
+    locazioni[BASILISCO] = init_Location("basilisco", text, &locazioni[SEGRETI], OGGETTO_LOC);
+    strcpy(text,"Avvicinandoti all'armadio appare un **molliccio**, dietro si intravede una **coppa**, devi battere il molliccio per poterci arrivare!");
+    locazioni[ARMADIO] = init_Location("armadio", text, &locazioni[ARTI_OSCURE], OGGETTO_LOC);
+    strcpy(text,"La fenice è la personale fenice di Albus Silente. Questo animale ha il piumato scarlatto e dorato, con una coda lunga come quella del pavone. Potrà aiutarti a sconfiggere Voldemort quando la chiami pronunciando il suo nome 'fanny'");
+    locazioni[FENICE] = init_Location("fenice", text, &locazioni[SILENTE], OGGETTO_LOC);
+
+// inizializzazione enigmi
+    strcpy(text,"La spada si presenta da sola davanti ai Grifondoro, noti per il loro coraggio. Devi dimostrare di esserne degno risolvendo questo quesito:\n"
+        "Quale animale è rappresentato sullo stemma della casata di Grifondoro?\n"
+        "a) Grifone b) Leone c) Aquila d) Lupo\n"
+        "[ inserisci una delle opzioni tramite a, b, c, d ]");
+    enigma_spada = init_Enigma(text, "b");
+    strcpy(text,"Pronuncia l'incantesimmo per liberarti del molliccio:");
+    enigma_molliccio = init_Enigma(text,"riddikulus");
+    strcpy(text,"Pronuncia l'incantesimmo per fermare il folletto:");
+    enigma_folletto = init_Enigma(text,"immobilus");
+    strcpy(text,"Pronuncia l'incantesimo per sbloccare il lucchetto:");
+    enigma_lucchetto = init_Enigma(text,"alohomora");
+
+// inizializzazione Object
+    strcpy(text,"La Spada di Godric Grifondoro è una spada di fattura Goblin appartenuta al celebre mago di età medievale, uno dei fondatori di Hogwarts");
+    oggetti[SPADA] = init_Object("spada", NORMAL_OBJ, &locazioni[SILENTE], text, false, true, &enigma_spada, TAKE, allowed_comandi1, NULL, NULL, NULL);
+    strcpy(text,"Questa è una bacchetta magica, può essere usata per lanciare qualche incantesimo");
+    oggetti[BACCHETTA] = init_Object("bacchetta", NORMAL_OBJ, &locazioni[SILENTE], text, false, true, NULL, NESSUN, allowed_comandi1, NULL, NULL, NULL);
+    strcpy(text,"Questo dente del basilisco possiede ancora il suo potente veleno");
+    oggetti[DENTE] = init_Object("dente", NORMAL_OBJ, &locazioni[SEGRETI], text, false, true, NULL, NESSUN, allowed_comandi1, NULL, NULL, NULL);
+    strcpy(text,"Il molliccio è una creatura magica che può assumere le sembianze di ciò che spaventa di più il mago che lo avvicina, per questo motivo temono le risate. Nessuno conosce l'aspetto di un molliccio quando è solo");
+    oggetti[MOLLICCIO] = init_Object("molliccio", NORMAL_OBJ, &locazioni[ARTI_OSCURE], text, false, true, &enigma_molliccio, USE2, allowed_comandi2, &oggetti[COPPA], NULL, NULL);
+    strcpy(text,"Un folletto di colore blu elettrico, alto circa venti centimetri e molto dispettoso, svolazza a giro per l'aula, andrebbe fermato per poter prendere il **medaglione** che ha al collo");
+    oggetti[FOLLETTO] = init_Object("folletto", NORMAL_OBJ, &locazioni[ARTI_OSCURE], text, false, true, &enigma_folletto, USE2, allowed_comandi2, &oggetti[MEDAGLIONE], NULL, NULL);
+    strcpy(text,"Questo è un lucchetto magico, non serve una chiave per aprirlo");
+    oggetti[LUCCHETTO] = init_Object("lucchetto", NORMAL_OBJ, &locazioni[NECESSITA], text, false, true, &enigma_lucchetto, USE2, allowed_comandi2, &oggetti[DIADEMA], NULL, NULL);
+// inizializzazione oggetti tipo horcrux
+    strcpy(text,"Il serpente sembra essere molto aggressivo e lascia scie di arti oscure, non bastera la bacchetta per ucciderlo...");
+    oggetti[SERPENTE] = init_Object("serpente", HORCRUX, &locazioni[INGRESSO], text, false, true, NULL, NESSUN, allowed_comandi2, NULL, &oggetti[SPADA], NULL);
+    strcpy(text,"L'anello di Orvoloson Gaunt è un oggetto magico, sembra un anello normale ma ha qualcosa di oscuro, non andrebbe toccato...");
+    oggetti[ANELLO] = init_Object("anello", HORCRUX, &locazioni[SILENTE], text, false, true, NULL, NESSUN, allowed_comandi2, NULL, &oggetti[SPADA], NULL);
+    strcpy(text,"Questo è il diario di Tom Riddle...");
+    oggetti[DIARIO] = init_Object("diario", HORCRUX, &locazioni[SEGRETI], text, false, true, NULL, NESSUN, allowed_comandi2, NULL, &oggetti[DENTE], NULL);
+    strcpy(text,"Il Diadema è un oggetto magico che apparteneva originarimente a Corinna Corvonero, una dei fondatori di Hogwarts. Sembra essere stato manomesso dalla magia oscura...");
+    oggetti[DIADEMA] = init_Object("diadema", HORCRUX, &locazioni[NECESSITA], text, false, true, NULL, NESSUN, allowed_comandi2, NULL, &oggetti[DENTE], &oggetti[LUCCHETTO]);
+    strcpy(text,"La Coppa è un oggetto magico appartenuto a una dei fondatori di Hogwarts, Tosca Tassorosso. Sembra avvolto dalle tenebre...");
+    oggetti[COPPA] = init_Object("coppa", HORCRUX, &locazioni[ARTI_OSCURE], text, false, true, NULL, NESSUN, allowed_comandi2, NULL, &oggetti[DENTE], &oggetti[MOLLICCIO]);
+    strcpy(text,"Il Medaglione è un oggetto appartenuto originariamente a Salazar Serpeverde, uno dei fondatori di Hogwarts. Pare ci siano delle voci, sembra vogliano ingannare chi le sente...");
+    oggetti[MEDAGLIONE] = init_Object("medaglione", HORCRUX, &locazioni[ARTI_OSCURE], text, false, true, NULL, NESSUN, allowed_comandi2, NULL, &oggetti[SPADA], &oggetti[FOLLETTO]);
+
+// GIOCO
+
+//init text iniziale
+    strcpy(text_attuale, stanza_attuale->look_text);
+
+//schermata iniziale
+    system("clear");
+    system("clear");
+    stampa_nome_game(game_name, rows_game_name);
+    printf("Benvenuto ad Hogwarts, celebre scuola di magia e stregoneria nel mondo di Harry Potter. Un'oscura minaccia si è infiltrata nel castello: Lord Voldemort! Ha nascosto i suoi Horcrux, frammenti della sua anima, in luoghi segreti all'interno delle mura. La tua missione è quella di individuare e distruggere questi Horcrux il prima possibile, liberando così la scuola dall'ombra del malvagio mago oscuro. Nel tuo cammino, terrai d'occhio il tempo rimanente in alto a destra e monitorerai il numero di Horcrux distrutti e quelli ancora da trovare a sinistra. Una mappa semplificata dei luoghi e della tua posizione ti guiderà mentre ti avventuri attraverso i corridoi e le aule di Hogwarts. Che la fortuna sia dalla tua parte\n");
+    
+    while(true){
+        param1_loc=NULL;
+        param1_obj=NULL;
+        param2_obj=NULL;
+
+        printf("\nPremi invio per continuare...");
+        getchar();
+        if(tempo_iniziale == 0){tempo_iniziale = get_current_time_seconds();}
+        
+        system("clear");
+
+        if( get_current_time_seconds() - tempo_iniziale >= GAME_DURATION){
+            fine_gioco(false);
+        }
+
+        // 
+        minuti=0,secondi=GAME_DURATION-(get_current_time_seconds()-tempo_iniziale);
+        for(;secondi>=60;secondi-=60){
+            minuti++;
+        }
+        char remaining_time[30],token_str[30];
+        sprintf(token_str,"Token raccolti: %d/%d",token_raccolti,TOT_TOKEN);
+        sprintf(remaining_time,"Tempo rimanente: %d min %d sec\n",minuti,secondi);
+        if(stanza_attuale==&locazioni[INGRESSO]) stampa(map0, token_str, remaining_time, rows_map, locazioni, oggetti, stanza_attuale);
+        else if(stanza_attuale==&locazioni[SILENTE]) stampa(map1, token_str, remaining_time, rows_map, locazioni, oggetti, stanza_attuale);
+        else if(stanza_attuale==&locazioni[SEGRETI]) stampa(map2, token_str, remaining_time, rows_map, locazioni, oggetti, stanza_attuale);
+        else if(stanza_attuale==&locazioni[NECESSITA]) stampa(map3, token_str, remaining_time, rows_map, locazioni, oggetti, stanza_attuale);
+        else if(stanza_attuale==&locazioni[ARTI_OSCURE]) stampa(map4, token_str, remaining_time, rows_map, locazioni, oggetti, stanza_attuale);
+        
+        //printf("stanza in cui ti trovi:\t%s\n",stanza_attuale->name);
+        printf("%s\n",text_attuale);
+        strcpy(text_attuale, stanza_attuale->look_text);
+
+        printf("\nInserisci la tua prossima mossa ('list' per la lista di comandi):\n>");
+        scanf(" %[^\n]", mossa); // Leggi tutti i caratteri fino al carattere di nuova riga
+
+        comando = strtok(mossa, " "); // Estrae il primo token (comando)
+        param1_str = strtok(NULL, " "); // Estrae il secondo token (primo parametro)
+        param2_str = strtok(NULL, " "); // Estrae il terzo token (secondo parametro)
+        
+        // prelevo i parametri
+        if(param1_str != NULL){
+            for(i = 0; i < NUM_LOCAZIONI; i++){
+                if(strcmp(param1_str, locazioni[i].name) == 0){
+                    param1_loc = &locazioni[i];
+                    break;
+                }
+            }
+            if(param1_loc == NULL){ // se non ho trovato locazioni corrispondenti potrebbe essere un oggetto
+                for(i = 0; i < NUM_OGGETTI; i++){
+                    if(strcmp(param1_str, oggetti[i].name) == 0){
+                        param1_obj = &oggetti[i];
+                        break;
+                    }
+                }
+                if(param2_str != NULL){ 
+                    for(i = 0; i < NUM_OGGETTI; i++){
+                        if(strcmp(param2_str, oggetti[i].name) == 0){
+                            param2_obj = &oggetti[i];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (strcmp(comando, "look") == 0) {
+            // Logica per gestire il comando "look"
+            if(param1_loc != NULL){
+                if (param1_loc->from_location == NULL || stanza_attuale == param1_loc || stanza_attuale == param1_loc->from_location) { // Se vuoi accedere all'ingresso || nella stanza in cui sei || in una stanza a cui puoi accedere
+                    if(param1_loc->tipo == STANZA){
+                        stanza_attuale = param1_loc;
+                    }
+                    strcpy(text_attuale, param1_loc->look_text);
+                } else {
+                    printf("Non puoi osservare la location %s dalla stanza in cui ti trovi\n", param1_loc->name);
+                }
+            }else if(param1_obj != NULL){
+                if (stanza_attuale == param1_obj->luogo) { 
+                    if(param1_obj->tipo == NORMAL_OBJ || (param1_obj->tipo == HORCRUX && (param1_obj->is_in_game || param1_obj->raccolto))){ //soltanto gli horcrux scompaiono dopo che li distruggi
+                        strcpy(text_attuale, param1_obj->look_text);
+                    }else{
+                        printf("Una volta distrutti gli Horcrux non lasciano traccia");
+                    }
+                } else {
+                    printf("Non puoi osservare l'oggetto %s dalla stanza in cui ti trovi\n", param1_obj->name);
+                }
+            }else{
+                printf("Location o Object non riconosciuti\n");
+            }
+        } else if (strcmp(comando, "take") == 0) {
+            if(param1_obj != NULL){
+                // Logica per gestire il comando "take"
+                if(stanza_attuale == param1_obj->luogo){
+                    // se sei nella stanza in cui puoi raggiungere quell'oggetto
+                    if(param1_obj->allowed_comandi[TAKE]){ 
+                        // se l'oggetto può essere raccolto (gli horcrux, il molliccio, folletto non possono)
+                        if(!param1_obj->raccolto){ 
+                            // se non è già stato raccolto 
+                            if(param1_obj->enigma != NULL && param1_obj->comando_per_enigma == TAKE){
+                                // se ha un enigma
+                                printf("%s\n>",param1_obj->enigma->domanda);
+                                scanf("%s",risposta);
+                                if(strcmp(risposta, param1_obj->enigma->risposta_corretta) == 0){
+                                    printf("Risposta corretta, puoi raccogliere l'oggetto %s!\n", param1_obj->name);
+                                    param1_obj->enigma = NULL;
+                                }else{
+                                    printf("Risposta errata!\n");
+                                }
+                            }else{
+                                if(oggetti_raccolti < MAX_OGGETTI_RACCOLTI){
+                                    printf("Hai raccolto l'oggetto %s\n", param1_obj->name);
+                                    param1_obj->raccolto = true;
+                                    oggetti_raccolti++;
+                                }else{
+                                    printf("Non puoi tenere più di %d oggetti, lasciane uno con il comando 'drop obj'",MAX_OGGETTI_RACCOLTI);
+                                }
+                            }
+                        }else{
+                            printf("Hai già raccolto l'oggetto %s\n", param1_obj->name);
+                        }
+                    }else{
+                        printf("L'oggetto %s non può essere raccolto\n", param1_obj->name);
+                    }
+                }else{
+                    printf("Non puoi prendere l' oggetto %s da qui\n", param1_obj->name);
+                }
+            }else{
+                printf("Oggetto non riconosciuto\n");
+            }
+        } else if (strcmp(comando, "use") == 0) {
+            // Logica per gestire il comando "use"
+            // Non ho considerato nel gioco l'opzione di usare un oggetto da solo 
+            if(param1_obj != NULL){
+                if(param2_obj != NULL){
+                    if(param1_obj->raccolto){
+                        if(param2_obj->luogo == stanza_attuale){
+                            if(param1_obj->allowed_comandi[USE1] && param2_obj->allowed_comandi[USE2]){
+                                if(param2_obj->is_in_game){
+                                    if(strcmp(param1_obj->name,"bacchetta") == 0 && param2_obj->enigma != NULL && param2_obj->comando_per_enigma == USE2){
+                                        // stai usando la bacchetta con il molliccio oppure con il folletto
+                                        printf("%s\n>",param2_obj->enigma->domanda);
+                                        scanf("%s",risposta);
+                                        if(strcmp(risposta, param2_obj->enigma->risposta_corretta) == 0){
+                                            printf("Risposta corretta, adesso l'oggetto %s è raggiungibile\n", param2_obj->object_unlocked);
+                                            param2_obj->enigma = NULL;
+                                            //param2_obj->is_in_game = false;
+                                            //param2_obj->object_unlocked->raccolto = true;
+                                            param2_obj->object_unlocked->locked_by = NULL; // sblocco l'oggetto
+                                        }else{
+                                            printf("Risposta errata!\n");
+                                        }
+                                    }else if(param2_obj->tipo == HORCRUX && param2_obj->locked_by == NULL && param1_obj == param2_obj->can_be_destroyed_by){
+                                        // stai usando spada o dente con un horcrux che non è bloccato (e se lo era ora non lo è più)
+                                        printf("Complimenti, hai distrutto l'Horcrux %s raccogliendo così uno dei token!\n", param2_obj->name);
+                                        param2_obj->raccolto = false;
+                                        param2_obj->is_in_game = false;
+                                        token_raccolti++;
+                                        if(token_raccolti == TOT_TOKEN){
+                                            fine_gioco(true);
+                                        }
+                                    }else{
+                                        if(param2_obj->locked_by != NULL){
+                                            printf("L'oggetto %s è bloccato", param2_obj->name);
+                                        }else{
+                                            printf("I due oggetti non hanno avuto effetto insieme");
+                                        }
+                                    }
+                                }else{
+                                    if(param2_obj->tipo==HORCRUX){
+                                        printf("L'horcrux %s è già stato distrutto!", param2_obj->name);
+                                    }else{
+                                        printf("L'oggetto %s non può più essere utilizzato", param2_obj->name);
+                                    }
+                                }
+                            }else{
+                                printf("Questi oggetti non possono essere usati in questo modo");
+                            }
+                        }else{
+                            printf("Non riesci a raggiungere l'oggetto %s da questa stanza", param2_obj->name);
+                        }
+                    }else{
+                        printf("per usare un oggetto nella prima posizione devi prima averlo raccolto");
+                    }
+                }else{
+                    printf("Questo oggetto non sembra avere effetto da solo");
+                }
+            }else{
+                printf("Oggetto non riconosciuto\n");
+            }
+        } else if ((strcmp(comando, "objs") == 0)) {
+            // Logica per gestire il comando "objs"
+            printf("Lista di oggetti raccolti:\n");
+            for(i=0; i<NUM_OGGETTI; i++){
+                if(oggetti[i].raccolto) printf("-%s\n",oggetti[i].name);
+            }
+        } else if (strcmp(comando, "list") == 0){
+            // Logica per gestire il comando "list"
+            stampa_comandi(comandi);
+        } else if (strcmp(comando, "fanny") == 0){
+            // Logica per gestire il comando "fanny"
+            clear_stdin();
+                
+            printf("\nPremi un invio per continuare...");
+            getchar();
+            
+            system("clear");
+
+            if(tempo_iniziale - get_current_time_seconds() >= GAME_DURATION){
+                fine_gioco(false);
+            }
+
+            printf("Token raccolti: %d/%d\t\t",token_raccolti, TOT_TOKEN);
+            minuti=0,secondi=GAME_DURATION-(get_current_time_seconds()-tempo_iniziale);
+            for(;secondi>=60;secondi-=60){
+                minuti++;
+            }
+            printf("Tempo rimanente:\t%d min %d sec\n",minuti,secondi);
+
+            printf("Fanny è arrivata in tuo soccorso, puoi fargli una domanda ma costerà un po' del tuo tempo rimanente!\n");
+            printf("Scrivi 'horcrux' per l'elenco di Horcrux nascosti nel castello (perdi %ds), scrivi il nome di un Horcrux per sapere come distruggerlo (perdi %ds): ",TIME_FOR_QUESTION/3,TIME_FOR_QUESTION);
+            
+            scanf("%s",mossa);
+            if(strcmp(mossa,"horcrux") == 0){
+                printf("Ecco l'elenco degli Horcux:\n");
+                for(i = 0; i < NUM_OGGETTI; i++){
+                    if(oggetti[i].tipo==HORCRUX){
+                        printf("%s\n",oggetti[i].name);
+                    }
+                }
+                tempo_iniziale -= (TIME_FOR_QUESTION/3);
+            }else{
+                for(i = 0; i<NUM_OGGETTI; i++){
+                    if(strcmp(oggetti[i].name,mossa) == 0 && oggetti[i].tipo!=HORCRUX){
+                        printf("Devi inserire il nome di un Horcrux!\n");
+                        break;
+                    }
+                    if(strcmp(oggetti[i].name,mossa) == 0){
+                        printf("Per distruggere questo horcrux devi usare il comando use e usare %s come primo oggetto", oggetti[i].can_be_destroyed_by);
+                        tempo_iniziale -= TIME_FOR_QUESTION;
+                        break;
+                    }
+                }
+            }
+        } else if(strcmp(comando, "drop") == 0){
+            if(param1_obj!=NULL && param2_obj==NULL){
+                if(param1_obj->raccolto){
+                    printf("hai lasciato l'oggetto %s, è tornato nel suo ruolo originale\n",param1_obj->name);
+                    param1_obj->raccolto=false;
+                    oggetti_raccolti--;
+                }else{
+                    printf("Non hai raccolto l'oggetto %s", param1_obj->name);
+                }
+            }else{
+                printf("Seleziona un oggetto da lasciare");
+            }
+        }else {
+            // Comando non riconosciuto
+            printf("Comando non riconosciuto\n");
+        }
+        
+        clear_stdin();
+    }
+}
